@@ -30,8 +30,10 @@
 -- ---------------------------------------------------------------------------
 
 {{ config(
-    materialized     = 'incremental',
-    on_schema_change = 'fail'
+    materialized         = 'incremental',
+    unique_key           = ['event_date', 'customer_id'],
+    incremental_strategy = 'merge',
+    on_schema_change     = 'fail'
 ) }}
 
 select
@@ -49,7 +51,10 @@ select
 from {{ ref('silver_events') }}
 
 {% if is_incremental() %}
-where event_date > (select max(event_date) from {{ this }})
+where event_date >= (
+    select coalesce(max(event_date), cast('1900-01-01' as date)) - interval '3' day
+    from {{ this }}
+)
 {% endif %}
 
 group by 1, 2, 3, 4

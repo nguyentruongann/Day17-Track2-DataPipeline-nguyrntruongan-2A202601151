@@ -35,20 +35,27 @@
 
 {{ config(materialized = 'table') }}
 
-with ranked as (
+with clean as (
 
     select
         *,
-        {{ normalize_priority('priority_raw') }}             as priority_clean,
+        {{ normalize_priority('priority_raw') }} as priority_clean
+    from {{ source('bronze', 'bronze_tickets_cdc') }}
+    where {{ normalize_priority('priority_raw') }} is not null
+
+),
+
+ranked as (
+
+    select
+        *,
         row_number() over (
             partition by ticket_id
             order by event_time desc, cdc_seq desc
         ) as _rn
-    from {{ source('bronze', 'bronze_tickets_cdc') }}
+    from clean
 
-),
-
-latest as (select * from ranked where _rn = 1)
+)
 
 select
     ticket_id,
@@ -65,5 +72,6 @@ select
     body,
     event_time                                               as updated_at,
     _ingested_at
-from latest
-where op <> 'd'
+from ranked
+where _rn = 1
+  and op <> 'd'
