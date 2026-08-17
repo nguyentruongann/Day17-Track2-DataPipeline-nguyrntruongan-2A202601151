@@ -1,12 +1,14 @@
 # Báo cáo LAB 17 — Data Pipeline Engineering
 
-**Họ tên:** Nguyễn Trường An  **Lớp:** E403  **Ngày:** 2026-08-17
+**Họ tên:** Nguyễn Trường An  
+**Lớp:** E403  
+**Ngày:** 2026-08-17
 
 ---
 
-## 0 · Kết quả cuối
+## 1. Kết quả sau khi hoàn thành
 
-Sau khi sửa, bộ tiêu chí cần đạt là:
+Sau khi kiểm tra và sửa các lỗi trong pipeline, kết quả cuối cùng như sau:
 
 ```text
 gold_training_set     12,480 / 12,480   ổn định ✓
@@ -18,7 +20,7 @@ DAG                    catchup=False / max_active_runs=1
 Tổng kết               4/4 tiêu chí đạt
 ```
 
-Checksum đối chiếu trên bộ seed deterministic của Lab:
+Checksum của các bảng sau khi chạy lại cũng không thay đổi:
 
 ```text
 gold_training_set     8dd7c98653
@@ -27,54 +29,133 @@ gold_doc_chunks       92d8e50131
 quarantine_tickets    ebb89036fb
 ```
 
-> Khi nộp bài, chạy `make verify` trên máy của bạn và dán nguyên output thực tế vào đây nếu giảng viên yêu cầu log đầy đủ thời gian từng lượt chạy.
+Như vậy, sau khi sửa, pipeline có thể chạy lại nhiều lần mà không làm thay đổi kết quả ngoài mong muốn.
 
 ---
 
-## 1 · Kích thước bảng training tăng sau mỗi lần chạy
+## 2. Lỗi `gold_training_set` bị tăng dữ liệu sau mỗi lần chạy
 
-| | |
-|---|---|
-| **Triệu chứng** | `gold_training_set` tăng số hàng sau mỗi lần chạy lại; trạng thái ban đầu có 38.750 hàng trong khi kỳ vọng 12.480, cùng một `ticket_id` bị lặp. |
-| **Nguyên nhân** | Model là `incremental` nhưng không khai báo `unique_key` và chiến lược ghi, nên dbt ghi kiểu append/`INSERT`. Retry cùng dữ liệu vì vậy ghi thêm thay vì thay thế. Đồng thời nguồn CDC có `op='u'`, nên cùng một entity ticket có thể xuất hiện ở nhiều ngày; cách xoá/ghi theo partition ngày không giải quyết đúng grain entity. |
-| **Cách khắc phục** | `dbt/models/gold/gold_training_set.sql`: thêm `unique_key='ticket_id'` và `incremental_strategy='merge'`. `dags/ai_training_pipeline.py`: đặt `catchup=False`, `max_active_runs=1` để tránh backfill/chạy song song làm tăng khả năng kích hoạt lỗi. |
-| **Bằng chứng** | Trước: 38.750 hàng, có ticket lặp. Sau: 12.480 hàng, 1 hàng / 1 ticket, checksum ổn định qua các lượt chạy. |
+Lỗi đầu tiên mình gặp là bảng `gold_training_set` cứ tăng số dòng sau mỗi lần chạy lại. Ban đầu bảng có 38.750 dòng, trong khi kết quả đúng chỉ cần 12.480 dòng. Khi kiểm tra kỹ thì thấy một `ticket_id` có thể xuất hiện nhiều lần.
 
----
+Nguyên nhân là model đang chạy theo kiểu `incremental`, nhưng chưa khai báo `unique_key` và cũng chưa dùng chiến lược `merge`. Vì vậy mỗi lần retry, dbt tiếp tục append dữ liệu mới vào bảng thay vì cập nhật bản ghi đã có.
 
-## 2 · Bảng đặc trưng theo ngày thiếu hàng ở các ngày quá khứ
+Ngoài ra, nguồn CDC có các bản ghi update (`op='u'`), nên cùng một ticket có thể xuất hiện ở nhiều thời điểm khác nhau. Nếu chỉ xử lý theo partition ngày thì vẫn chưa giải quyết đúng vấn đề vì grain thực tế của bảng là theo `ticket_id`.
 
-| | |
-|---|---|
-| **Triệu chứng** | `gold_feature_daily` ổn định nhưng chỉ có 8.645 hàng, thiếu 455 hàng so với kỳ vọng 9.100. Các hàng thiếu tập trung ở ngày cũ. |
-| **P99 độ trễ đo được** | **2,73 ngày**. Max khoảng **2,94 ngày**; tỷ lệ bản ghi tới muộn hơn 1 ngày khoảng **16,5%**. |
-| **Lookback đã chọn** | **3 ngày**, lấy theo P99 và làm tròn lên để bao phủ phần lớn dữ liệu tới muộn mà không quét lại lịch sử quá rộng ở mọi lượt chạy. |
-| **Nguyên nhân** | Điều kiện `event_date > max(event_date)` chỉ lấy ngày mới hơn ngày lớn nhất đã có. Một event xảy ra ở ngày cũ nhưng tới warehouse muộn sẽ luôn nhỏ hơn `max(event_date)` và bị bỏ lỡ vĩnh viễn. Khi mở rộng lookback, nếu vẫn append thì cùng grain `(event_date, customer_id)` lại bị cộng dồn. |
-| **Cách khắc phục** | `dbt/models/gold/gold_feature_daily.sql`: dùng lookback 3 ngày, `event_date >= max(event_date) - interval '3' day`; thêm `unique_key=['event_date','customer_id']` và `incremental_strategy='merge'`. |
-| **Bằng chứng** | Trước: 8.645 hàng. Sau: 9.100 hàng, checksum ổn định; `gold_training_set` vẫn giữ 12.480 hàng. |
+Mình sửa `dbt/models/gold/gold_training_set.sql` bằng cách thêm:
 
-**Vì sao dùng P99 thay vì `max`?** P99 là ngưỡng định lượng đại diện cho phần đuôi dữ liệu nhưng ít bị chi phối bởi outlier. Mỗi ngày lookback tăng thêm làm tăng lượng dữ liệu phải quét lại ở mọi lần chạy sau; chọn theo `max` có thể khiến chi phí tăng mạnh chỉ vì một trường hợp cực đoan hiếm gặp.
+```text
+unique_key = 'ticket_id'
+incremental_strategy = 'merge'
+```
 
----
+Ở DAG mình cũng đặt:
 
-## 3 · Kiểu dữ liệu cột `priority` thay đổi giữa chu kỳ
+```text
+catchup=False
+max_active_runs=1
+```
 
-| | |
-|---|---|
-| **Triệu chứng** | Từ 08-10 nguồn chuyển `priority` từ số sang nhãn chữ. Pipeline không dừng nhưng Silver có 6.606 hàng NULL/ngoài miền 1..4, trong khi `quarantine_tickets` = 0. |
-| **Nguyên nhân** | Macro cũ dùng `try_cast(priority_raw as integer)`: nhãn chữ hợp lệ (`urgent/high/medium/low`) bị biến thành NULL, nhưng các số sai miền như `0`, `5`, `-1` lại được chấp nhận. Contract đang tắt và không có test miền giá trị. |
-| **Ba nhóm giá trị** | Nhóm 1: `1..4` → giữ nguyên. Nhóm 2: `urgent/high/medium/low` → map về `1/2/3/4` vì chỉ là schema evolution. Nhóm 3: `P1`, `unknown`, `0`, `5`, `-1`, chuỗi rỗng, NULL → quarantine. |
-| **Cách khắc phục** | `normalize_priority.sql`: CASE chuẩn hoá 3 nhóm. `silver_tickets.sql`: lọc bản ghi priority hỏng **trước** `row_number`, nhưng giữ `op='d'` đến sau khi rank để không làm sống lại ticket đã xoá. `quarantine_tickets.sql`: lấy đúng các row macro trả NULL. `schema.yml`: bật `contract.enforced: true`, thêm `not_null` và `accepted_values [1,2,3,4]`. |
-| **Bằng chứng** | `quarantine_tickets` = 312 hàng; `silver_tickets` vẫn đủ 12.480 ticket; priority sạch, luôn 1..4; `dbt test` tăng từ 9 lên 11 test và pass. |
+Mục đích là tránh việc Airflow tự chạy bù quá nhiều ngày hoặc có nhiều lượt pipeline chạy song song.
 
-**Thiết kế tầng xử lý:** Bronze nên giữ nguyên dữ liệu thô để phục vụ truy nguyên. Contract/normalization nên áp dụng từ Silver. Khi chỉ có một tập nhỏ bản ghi hỏng, tách chúng vào quarantine cho phép phần dữ liệu tốt tiếp tục phục vụ downstream thay vì dừng toàn bộ pipeline.
+Sau khi sửa, `gold_training_set` còn đúng 12.480 dòng. Mỗi ticket chỉ còn một bản ghi và checksum không đổi khi chạy lại nhiều lần.
 
 ---
 
-## 4 · Tổng kết
+## 3. `gold_feature_daily` bị thiếu dữ liệu của các ngày cũ
 
-| Nhiệm vụ | Điều cần kiểm tra đầu tiên khi nhận một pipeline lạ |
-|---|---|
-| 1 | Grain, natural key và chiến lược ghi của mọi incremental model. |
-| 2 | Phân bố `_ingested_at - event_time` và điều kiện lọc incremental có lookback hay không. |
-| 3 | Phân bố giá trị ở Bronze/Silver, data contract, test miền giá trị và luồng quarantine. |
+Vấn đề tiếp theo nằm ở bảng `gold_feature_daily`. Bảng này không bị tăng dữ liệu như lỗi trên, nhưng chỉ có 8.645 dòng thay vì 9.100 dòng, tức là thiếu 455 dòng.
+
+Khi kiểm tra dữ liệu tới muộn, mình đo được:
+
+- P99 độ trễ khoảng **2,73 ngày**
+- Độ trễ lớn nhất khoảng **2,94 ngày**
+- Khoảng **16,5%** bản ghi tới muộn hơn 1 ngày
+
+Điều kiện incremental ban đầu chỉ lấy những dòng có:
+
+```text
+event_date > max(event_date)
+```
+
+Cách này có vấn đề với late-arriving data. Ví dụ một event của ngày cũ nhưng đến warehouse trễ thì `event_date` của nó vẫn nhỏ hơn ngày lớn nhất đã có trong bảng. Kết quả là bản ghi đó không bao giờ được lấy vào ở những lần chạy sau.
+
+Mình chọn lookback **3 ngày** vì P99 là 2,73 ngày, làm tròn lên 3 ngày là đủ bao phủ gần như toàn bộ dữ liệu tới muộn trong bộ dữ liệu của bài.
+
+Điều kiện incremental được đổi thành:
+
+```text
+event_date >= max(event_date) - interval '3' day
+```
+
+Đồng thời mình thêm:
+
+```text
+unique_key = ['event_date', 'customer_id']
+incremental_strategy = 'merge'
+```
+
+Phần `merge` khá quan trọng. Nếu chỉ mở rộng lookback mà vẫn append thì những ngày được đọc lại sẽ tiếp tục bị ghi trùng.
+
+Sau khi sửa, `gold_feature_daily` đạt đủ **9.100 dòng** và checksum vẫn ổn định qua các lần chạy.
+
+Mình dùng P99 thay vì lấy độ trễ lớn nhất vì trong thực tế có thể có một vài bản ghi tới rất muộn. Nếu lấy `max` để quyết định lookback thì pipeline có thể phải quét lại quá nhiều ngày chỉ vì một số ít trường hợp đặc biệt. Với bộ dữ liệu của lab này, 3 ngày là mức hợp lý.
+
+---
+
+## 4. Cột `priority` thay đổi kiểu dữ liệu
+
+Lỗi thứ ba liên quan tới cột `priority`.
+
+Ở những ngày đầu, `priority` được lưu dưới dạng số từ 1 đến 4. Nhưng từ ngày 08-10, nguồn bắt đầu gửi thêm dạng chữ như `urgent`, `high`, `medium`, `low`.
+
+Pipeline cũ dùng:
+
+```text
+try_cast(priority_raw as integer)
+```
+
+Do đó các giá trị dạng chữ đều trở thành `NULL`. Trong khi đó một số giá trị số sai như `0`, `5`, `-1` lại vẫn cast sang integer được nên không bị phát hiện ngay.
+
+Khi kiểm tra, Silver có tới 6.606 dòng bị NULL hoặc nằm ngoài miền 1..4 nhưng bảng `quarantine_tickets` lúc đó vẫn bằng 0.
+
+Mình chia dữ liệu thành ba nhóm:
+
+- `1, 2, 3, 4`: giữ nguyên
+- `urgent, high, medium, low`: map lần lượt về `1, 2, 3, 4`
+- Các giá trị như `P1`, `unknown`, `0`, `5`, `-1`, chuỗi rỗng hoặc NULL: đưa vào quarantine
+
+Macro `normalize_priority.sql` được sửa để xử lý các trường hợp trên bằng `CASE`.
+
+Trong `silver_tickets.sql`, các dòng có priority lỗi được tách ra trước bước `row_number`. Riêng bản ghi delete (`op='d'`) vẫn phải giữ đến sau khi rank, nếu bỏ quá sớm thì có thể làm một ticket đã bị xóa xuất hiện trở lại từ phiên bản cũ.
+
+Mình cũng bổ sung kiểm tra trong `schema.yml`:
+
+```text
+contract.enforced: true
+not_null
+accepted_values: [1, 2, 3, 4]
+```
+
+Sau khi sửa:
+
+- `quarantine_tickets` có đúng **312 dòng**
+- `silver_tickets` vẫn giữ đủ **12.480 ticket**
+- `priority` trong Silver chỉ còn các giá trị từ 1 đến 4
+- `dbt test` tăng từ 9 test lên 11 test và **11/11 đều pass**
+
+Theo mình, dữ liệu thô ở Bronze nên được giữ nguyên để sau này còn kiểm tra lại nguồn. Việc chuẩn hóa và kiểm tra kiểu dữ liệu phù hợp hơn khi đưa sang Silver. Những dòng lỗi có thể tách sang quarantine để pipeline vẫn xử lý được phần dữ liệu tốt thay vì dừng toàn bộ.
+
+---
+
+## 5. Kết luận
+
+Qua bài lab này, mình thấy có ba điểm cần kiểm tra khá sớm khi làm việc với một data pipeline dùng incremental model.
+
+Thứ nhất là phải xác định đúng grain và khóa của bảng. Nếu một model incremental không có `unique_key` hoặc dùng sai chiến lược ghi thì retry rất dễ sinh dữ liệu trùng.
+
+Thứ hai là cần kiểm tra độ trễ của dữ liệu trước khi đặt điều kiện incremental. Chỉ lấy dữ liệu mới hơn `max(event_date)` sẽ không phù hợp nếu nguồn có late-arriving data.
+
+Cuối cùng là không nên giả định schema của nguồn sẽ luôn giữ nguyên. Với các cột quan trọng như `priority`, nên có bước normalize, data contract và test miền giá trị. Những dòng không hợp lệ có thể đưa sang quarantine để vừa giữ được dữ liệu lỗi để kiểm tra, vừa không ảnh hưởng tới phần dữ liệu hợp lệ.
+
+Sau các thay đổi trên, cả bốn tiêu chí của bài đều đạt và kết quả giữ ổn định khi chạy lại pipeline.
+## Bug khi run môi trường chạy $env:PYTHONUTF8="1"
